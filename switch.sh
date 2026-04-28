@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
+#
+# claude-switch — manage multiple Claude CLI accounts on one machine.
+#
+# Strategy: Claude reads credentials from a single file ($CRED_FILE). We park
+# per-account copies under $DATA_DIR and swap the live file in/out on switch.
+# Before every swap we copy the live file back to the active account's slot
+# so any OAuth token refresh that happened mid-session is preserved.
+#
+# Data layout under ~/.claude-switch/:
+#   accounts.json                  — metadata map: { "<id>": { identifier, username, description, lastUsed } }
+#   active                         — single line containing the currently-active account id
+#   account<N>.credentials.json    — parked credential copies, one per account
+#
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="$HOME/.claude-switch"
-CRED_LINK="$HOME/.claude/.credentials.json"
-ACCOUNTS_FILE="$DATA_DIR/accounts.json"
+DATA_DIR="$HOME/.claude-switch"            # Per-account credential store + state
+CRED_FILE="$HOME/.claude/.credentials.json" # The live file Claude actually reads
+ACCOUNTS_FILE="$DATA_DIR/accounts.json"    # Account metadata (see header)
+ACTIVE_FILE="$DATA_DIR/active"             # Holds the active account id
 
-# Ensure data directory exists
 mkdir -p "$DATA_DIR"
 
-# Colors
+# ANSI colors for terminal output
 BOLD='\033[1m'
 DIM='\033[2m'
 GREEN='\033[32m'
@@ -32,17 +44,20 @@ if [[ ! -f "$ACCOUNTS_FILE" ]]; then
     echo -e "${DIM}Run 'claude-switch import' to import your current session, or 'claude-switch add' to add a new account.${RESET}"
 fi
 
-# Get the currently active account number from symlink
+# Get the currently active account number from state file
 get_active() {
-    if [[ -L "$CRED_LINK" ]]; then
-        local target
-        target=$(readlink "$CRED_LINK")
-        if [[ "$target" =~ account([0-9]+)\.credentials\.json$ ]]; then
-            echo "${BASH_REMATCH[1]}"
-            return
-        fi
-    fi
-    echo ""
+    [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE" || echo ""
+}
+
+# Save live credentials file back to the active account's store, preserving
+# any token refresh that happened since the last switch.
+save_back_active() {
+    local active
+    active=$(get_active)
+    [[ -z "$active" ]] && return 0
+    [[ -f "$CRED_FILE" ]] || return 0
+    local cred_file="$DATA_DIR/account${active}.credentials.json"
+    cp "$CRED_FILE" "$cred_file"
 }
 
 # Get account metadata field
@@ -51,7 +66,10 @@ get_meta() {
     jq -r --arg id "$id" --arg f "$field" '.[$id][$f] // ""' "$ACCOUNTS_FILE"
 }
 
-# Update lastUsed timestamp
+# Update lastUsed timestamp.
+# Note: jq can't safely read and write the same file, so we capture into $tmp
+# first. With `set -e`, a failing jq aborts before the redirect truncates the
+# accounts file. This same idiom is used everywhere we mutate accounts.json.
 touch_account() {
     local id="$1"
     local now
@@ -177,8 +195,13 @@ do_switch() {
         return
     fi
 
-    rm -f "$CRED_LINK"
-    ln -s "$cred_file" "$CRED_LINK"
+    # Preserve any token refresh on the outgoing account, then swap the live
+    # credentials file to the new account and record it as active.
+    save_back_active
+    mkdir -p "$(dirname "$CRED_FILE")"
+    cp "$cred_file" "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+    echo "$id" > "$ACTIVE_FILE"
     touch_account "$id"
     sync_metadata "$id"
 
@@ -292,21 +315,39 @@ do_menu() {
     esac
 }
 
-# Login flow — setup or refresh credentials for an account
+# Login flow — setup or refresh credentials for an account.
+# Optional second arg pre-populates the email on the OAuth login page via
+# `claude auth login --email`, saving the user a step in the browser.
 do_login() {
     local id="$1"
+    local email="${2:-}"
     local cred_file="$DATA_DIR/account${id}.credentials.json"
 
-    [[ -f "$cred_file" ]] || echo '{}' > "$cred_file"
+    # Park outgoing account's tokens, then point the live file at this account
+    # so `claude auth login` writes its OAuth result directly into the right slot.
+    save_back_active
 
-    rm -f "$CRED_LINK"
-    ln -s "$cred_file" "$CRED_LINK"
+    # Seed the live credentials file with the account's existing creds (if any)
+    mkdir -p "$(dirname "$CRED_FILE")"
+    if [[ -f "$cred_file" ]]; then
+        cp "$cred_file" "$CRED_FILE"
+    else
+        echo '{}' > "$CRED_FILE"
+    fi
+    chmod 600 "$CRED_FILE"
+    echo "$id" > "$ACTIVE_FILE"
 
     echo -e "${CYAN}Launching Claude login for account $id…${RESET}"
     echo -e "${DIM}Complete the OAuth flow in your browser.${RESET}"
 
-    # Tokens write through the symlink into the account file
-    claude login
+    if [[ -n "$email" ]]; then
+        claude auth login --email "$email"
+    else
+        claude auth login
+    fi
+
+    # Persist the freshly-written tokens back to the account store
+    cp "$CRED_FILE" "$cred_file"
 
     touch_account "$id"
     sync_metadata "$id"
@@ -323,7 +364,7 @@ do_add() {
 
     local name username description
     name=$(gum input --placeholder "Identifier (e.g. Work, Personal)" --header "New Account #$new_id")
-    username=$(gum input --placeholder "Username/email (optional)" --header "Username")
+    username=$(gum input --placeholder "Email (pre-fills login page)" --header "Email")
     description=$(gum input --placeholder "Description (optional)" --header "Description")
 
     [[ -z "$name" ]] && name="Account $new_id"
@@ -334,7 +375,7 @@ do_add() {
     echo "$tmp" > "$ACCOUNTS_FILE"
 
     echo -e "${GREEN}Created account $new_id ($name)${RESET}"
-    do_login "$new_id"
+    do_login "$new_id" "$username"
 }
 
 # Edit account metadata
@@ -381,8 +422,8 @@ do_remove() {
 
 # Import current active session as a new account
 do_import() {
-    local src="$CRED_LINK"
-    [[ -f "$src" ]] || die "No credentials found at $src — are you logged in?"
+    local src="$CRED_FILE"
+    [[ -f "$src" && ! -L "$src" ]] || die "No regular credentials file at $src — are you logged in? (If this is a symlink from an older claude-switch, remove it first.)"
 
     local max_id=0
     for id in $(get_account_ids); do
@@ -402,8 +443,7 @@ do_import() {
         '.[$id] = {"identifier": $name, "username": "", "description": "", "lastUsed": ""}' "$ACCOUNTS_FILE")
     echo "$tmp" > "$ACCOUNTS_FILE"
 
-    rm -f "$CRED_LINK"
-    ln -s "$cred_file" "$CRED_LINK"
+    echo "$new_id" > "$ACTIVE_FILE"
 
     touch_account "$new_id"
     sync_metadata "$new_id"
